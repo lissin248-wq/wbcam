@@ -1,0 +1,299 @@
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  GitHub Actions — Webcam Cropper com Grounded SAM 2            ║
+# ║  Executa webcam_cropper.py e envia resultado como Artifact     ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+name: "✂️ Webcam Cropper"
+
+# ── Triggers ──
+on:
+  push:
+    paths:
+      - "frame.png"
+      - "webcam_cropper.py"
+      - ".github/workflows/webcam-cropper.yml"
+  workflow_dispatch:
+    inputs:
+      box_threshold:
+        description: "Grounding DINO box threshold"
+        required: false
+        default: "0.25"
+        type: string
+      text_threshold:
+        description: "Grounding DINO text threshold"
+        required: false
+        default: "0.20"
+        type: string
+      padding:
+        description: "Padding extra (pixels)"
+        required: false
+        default: "5"
+        type: string
+
+jobs:
+  crop-webcam:
+    name: "Detectar e Recortar Webcam"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      PYTHON_VERSION: "3.11"
+      TORCH_HOME: ${{ github.workspace }}/.cache/torch
+      HF_HOME: ${{ github.workspace }}/.cache/huggingface
+      SAM2_CHECKPOINT_URL: "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt"
+      SAM2_CHECKPOINT_FILE: "sam2.1_hiera_large.pt"
+      GROUNDED_SAM2_DIR: "Grounded-SAM-2"
+
+    steps:
+      # ════════════════════════════════════════════
+      #  1. CHECKOUT DO REPOSITÓRIO
+      # ════════════════════════════════════════════
+      - name: "📥 Checkout do repositório"
+        uses: actions/checkout@v4
+
+      - name: "🔍 Verificar arquivos necessários"
+        run: |
+          echo "═══════════════════════════════════════"
+          echo "  Verificando arquivos na raiz..."
+          echo "═══════════════════════════════════════"
+
+          if [ ! -f "webcam_cropper.py" ]; then
+            echo "❌ ERRO: webcam_cropper.py não encontrado na raiz!"
+            exit 1
+          fi
+          echo "✅ webcam_cropper.py encontrado"
+
+          if [ ! -f "frame.png" ]; then
+            echo "❌ ERRO: frame.png não encontrado na raiz!"
+            exit 1
+          fi
+          echo "✅ frame.png encontrado ($(du -h frame.png | cut -f1))"
+
+          echo ""
+          echo "Conteúdo da raiz:"
+          ls -lah frame.png webcam_cropper.py
+
+      # ════════════════════════════════════════════
+      #  2. SETUP PYTHON
+      # ════════════════════════════════════════════
+      - name: "🐍 Setup Python ${{ env.PYTHON_VERSION }}"
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # ════════════════════════════════════════════
+      #  3. CACHES (pip + HuggingFace + Checkpoint)
+      # ════════════════════════════════════════════
+      - name: "💾 Cache — pip packages"
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('**/requirements*.txt') }}-grounded-sam2-v2
+          restore-keys: |
+            pip-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-
+
+      - name: "💾 Cache — HuggingFace models"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.HF_HOME }}
+          key: hf-grounding-dino-tiny-v1
+          restore-keys: |
+            hf-grounding-dino-
+
+      - name: "💾 Cache — SAM 2.1 Checkpoint"
+        id: cache-sam2
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GROUNDED_SAM2_DIR }}/checkpoints/${{ env.SAM2_CHECKPOINT_FILE }}
+          key: sam2-checkpoint-${{ env.SAM2_CHECKPOINT_FILE }}
+
+      # ════════════════════════════════════════════
+      #  4. CLONAR GROUNDED-SAM-2
+      # ════════════════════════════════════════════
+      - name: "📦 Clonar Grounded-SAM-2"
+        run: |
+          git clone --depth 1 https://github.com/IDEA-Research/Grounded-SAM-2.git ${{ env.GROUNDED_SAM2_DIR }}
+          echo "✅ Grounded-SAM-2 clonado"
+          ls -la ${{ env.GROUNDED_SAM2_DIR }}/
+
+      # ════════════════════════════════════════════
+      #  5. INSTALAR DEPENDÊNCIAS
+      # ════════════════════════════════════════════
+      - name: "⚙️ Instalar PyTorch (CPU)"
+        run: |
+          pip install --upgrade pip
+          pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          python -c "import torch; print(f'PyTorch {torch.__version__} | CUDA: {torch.cuda.is_available()}')"
+
+      - name: "⚙️ Instalar SAM 2"
+        working-directory: ${{ env.GROUNDED_SAM2_DIR }}
+        run: |
+          pip install -e ".[notebooks]"
+          echo "✅ SAM 2 instalado"
+
+      - name: "⚙️ Instalar dependências Python"
+        run: |
+          pip install \
+            opencv-python-headless \
+            pillow \
+            numpy \
+            transformers \
+            supervision
+          echo ""
+          echo "═══ Versões instaladas ═══"
+          python -c "
+          import torch, cv2, PIL, numpy, transformers
+          print(f'  torch:        {torch.__version__}')
+          print(f'  opencv:       {cv2.__version__}')
+          print(f'  pillow:       {PIL.__version__}')
+          print(f'  numpy:        {numpy.__version__}')
+          print(f'  transformers: {transformers.__version__}')
+          "
+
+      # ════════════════════════════════════════════
+      #  6. DOWNLOAD CHECKPOINT SAM 2.1
+      # ════════════════════════════════════════════
+      - name: "⬇️ Download SAM 2.1 Large checkpoint"
+        if: steps.cache-sam2.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ${{ env.GROUNDED_SAM2_DIR }}/checkpoints
+          echo "Baixando SAM 2.1 Large (~900MB)..."
+          wget -q --show-progress -O \
+            ${{ env.GROUNDED_SAM2_DIR }}/checkpoints/${{ env.SAM2_CHECKPOINT_FILE }} \
+            ${{ env.SAM2_CHECKPOINT_URL }}
+          echo ""
+          ls -lh ${{ env.GROUNDED_SAM2_DIR }}/checkpoints/${{ env.SAM2_CHECKPOINT_FILE }}
+          echo "✅ Checkpoint baixado"
+
+      - name: "✅ Verificar checkpoint (cache hit)"
+        if: steps.cache-sam2.outputs.cache-hit == 'true'
+        run: |
+          echo "✅ Checkpoint restaurado do cache!"
+          ls -lh ${{ env.GROUNDED_SAM2_DIR }}/checkpoints/${{ env.SAM2_CHECKPOINT_FILE }}
+
+      # ════════════════════════════════════════════
+      #  7. COPIAR ARQUIVOS PARA GROUNDED-SAM-2
+      # ════════════════════════════════════════════
+      - name: "📋 Copiar webcam_cropper.py e frame.png"
+        run: |
+          cp webcam_cropper.py ${{ env.GROUNDED_SAM2_DIR }}/
+          cp frame.png ${{ env.GROUNDED_SAM2_DIR }}/
+
+          echo "═══ Arquivos no diretório de trabalho ═══"
+          ls -lah ${{ env.GROUNDED_SAM2_DIR }}/webcam_cropper.py
+          ls -lah ${{ env.GROUNDED_SAM2_DIR }}/frame.png
+
+          echo ""
+          echo "═══ Estrutura de checkpoints ═══"
+          ls -lah ${{ env.GROUNDED_SAM2_DIR }}/checkpoints/
+
+      # ════════════════════════════════════════════
+      #  8. EXECUTAR WEBCAM CROPPER
+      # ════════════════════════════════════════════
+      - name: "🚀 Executar Webcam Cropper"
+        working-directory: ${{ env.GROUNDED_SAM2_DIR }}
+        env:
+          BOX_THRESH: ${{ github.event.inputs.box_threshold || '0.25' }}
+          TEXT_THRESH: ${{ github.event.inputs.text_threshold || '0.20' }}
+          PADDING: ${{ github.event.inputs.padding || '5' }}
+        run: |
+          echo "╔══════════════════════════════════════════╗"
+          echo "║  Executando Webcam Cropper...            ║"
+          echo "║  box_threshold:  ${BOX_THRESH}                  ║"
+          echo "║  text_threshold: ${TEXT_THRESH}                  ║"
+          echo "║  padding:        ${PADDING}px                     ║"
+          echo "╚══════════════════════════════════════════╝"
+          echo ""
+
+          python webcam_cropper.py \
+            -i frame.png \
+            -o ./output \
+            --box-threshold ${BOX_THRESH} \
+            --text-threshold ${TEXT_THRESH} \
+            --padding ${PADDING}
+
+          echo ""
+          echo "═══ Conteúdo do output ═══"
+          ls -lah ./output/ || echo "⚠️ Diretório output vazio ou não criado"
+
+      # ════════════════════════════════════════════
+      #  9. UPLOAD DOS RESULTADOS
+      # ════════════════════════════════════════════
+      - name: "📤 Upload — Webcam Crop (resultado final)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webcam-crop-result
+          path: ${{ env.GROUNDED_SAM2_DIR }}/output/*_webcam_crop.png
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: "📤 Upload — Debug images (detecção + máscara)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webcam-crop-debug
+          path: |
+            ${{ env.GROUNDED_SAM2_DIR }}/output/*_dino_detection.png
+            ${{ env.GROUNDED_SAM2_DIR }}/output/*_sam2_mask.png
+            ${{ env.GROUNDED_SAM2_DIR }}/output/*_mask_binary.png
+          if-no-files-found: warn
+          retention-days: 15
+
+      - name: "📤 Upload — Todos os arquivos (completo)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webcam-crop-all
+          path: ${{ env.GROUNDED_SAM2_DIR }}/output/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ════════════════════════════════════════════
+      #  10. RESUMO
+      # ════════════════════════════════════════════
+      - name: "📊 Resumo no Job Summary"
+        if: always()
+        run: |
+          echo "## ✂️ Webcam Cropper — Resultado" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          OUTPUT_DIR="${{ env.GROUNDED_SAM2_DIR }}/output"
+
+          if [ -d "$OUTPUT_DIR" ] && [ "$(ls -A $OUTPUT_DIR 2>/dev/null)" ]; then
+            CROP_FILE=$(find $OUTPUT_DIR -name "*_webcam_crop.png" | head -1)
+
+            if [ -n "$CROP_FILE" ]; then
+              DIMENSIONS=$(python -c "
+          from PIL import Image
+          img = Image.open('$CROP_FILE')
+          print(f'{img.size[0]}x{img.size[1]}')
+          " 2>/dev/null || echo "N/A")
+
+              SIZE=$(du -h "$CROP_FILE" | cut -f1)
+
+              echo "| Item | Valor |" >> $GITHUB_STEP_SUMMARY
+              echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+              echo "| **Status** | ✅ Sucesso |" >> $GITHUB_STEP_SUMMARY
+              echo "| **Dimensões do crop** | ${DIMENSIONS} |" >> $GITHUB_STEP_SUMMARY
+              echo "| **Tamanho do arquivo** | ${SIZE} |" >> $GITHUB_STEP_SUMMARY
+              echo "| **Imagem original** | frame.png |" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "### 📦 Artifacts gerados" >> $GITHUB_STEP_SUMMARY
+              echo "- \`webcam-crop-result\` — Recorte final da webcam" >> $GITHUB_STEP_SUMMARY
+              echo "- \`webcam-crop-debug\` — Imagens de debug (detecção + máscara)" >> $GITHUB_STEP_SUMMARY
+              echo "- \`webcam-crop-all\` — Todos os arquivos" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| Status | ❌ Nenhum crop gerado |" >> $GITHUB_STEP_SUMMARY
+            fi
+
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 📁 Arquivos gerados" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            ls -lh $OUTPUT_DIR/ >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Falha**: Nenhum arquivo de saída foi gerado." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Tente reduzir os thresholds via workflow_dispatch." >> $GITHUB_STEP_SUMMARY
+          fi
